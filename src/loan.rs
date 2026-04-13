@@ -1,6 +1,6 @@
 use crate::errors::ContractError;
 use crate::helpers::{
-    config, get_active_loan_record, has_active_loan, next_loan_id, require_allowed_token,
+    config, get_active_loan_record, get_slash_balance, has_active_loan, next_loan_id, require_allowed_token,
     require_not_paused,
 };
 use crate::reputation::ReputationNftExternalClient;
@@ -148,8 +148,7 @@ pub fn request_loan(
             amount,
             amount_repaid: 0,
             total_yield,
-            repaid: false,
-            defaulted: false,
+            status: LoanStatus::Active,
             created_at: now,
             disbursement_timestamp: now,
             repayment_timestamp: None,
@@ -197,12 +196,9 @@ pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractE
     if borrower != loan.borrower {
         return Err(ContractError::UnauthorizedCaller);
     }
-    if loan.defaulted || loan.repaid {
+    if loan.status != LoanStatus::Active {
         return Err(ContractError::NoActiveLoan);
     }
-
-    assert!(!loan.defaulted, "loan already defaulted");
-    assert!(!loan.repaid, "loan already repaid");
     assert!(
         env.ledger().timestamp() <= loan.deadline,
         "loan deadline has passed"
@@ -228,8 +224,12 @@ pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractE
             .persistent()
             .get(&DataKey::Vouches(borrower.clone()))
             .unwrap_or(Vec::new(&env));
-        // Only distribute yield to vouches in the same token as the loan.
+        
+        // Issue 112: Only distribute yield to vouches in the same token as the loan.
+        // Verify that available funds exclude slash balance to prevent fund leakage.
         let loan_token = soroban_sdk::token::Client::new(&env, &loan.token_address);
+        let slash_balance = get_slash_balance(&env);
+        
         let mut total_stake: i128 = 0;
         for v in vouches.iter() {
             if v.token == loan.token_address {
@@ -237,15 +237,27 @@ pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractE
             }
         }
 
+        // Issue 112: Ensure yield distribution respects available funds (excluding slash balance)
+        let available_for_yield = loan.total_yield;
+        let mut total_distributed: i128 = 0;
+
         for v in vouches.iter() {
             if v.token != loan.token_address {
                 continue;
             }
             let voucher_yield = if total_stake > 0 {
-                loan.total_yield * v.stake / total_stake
+                (available_for_yield * v.stake) / total_stake
             } else {
                 0
             };
+            total_distributed += voucher_yield;
+            
+            // Assert that we're not exceeding available yield
+            assert!(
+                total_distributed <= available_for_yield,
+                "yield distribution would exceed available funds"
+            );
+            
             loan_token.transfer(
                 &env.current_contract_address(),
                 &v.voucher,
@@ -253,7 +265,7 @@ pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractE
             );
         }
 
-        loan.repaid = true;
+        loan.status = LoanStatus::Repaid;
         loan.repayment_timestamp = Some(env.ledger().timestamp());
 
         // Pay referral bonus if a referrer is registered.
@@ -268,6 +280,8 @@ pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractE
                 .get(&DataKey::ReferralBonusBps)
                 .unwrap_or(DEFAULT_REFERRAL_BONUS_BPS);
             let bonus = loan.amount * bonus_bps as i128 / 10_000;
+            
+            // Issue 112: Ensure bonus doesn't use slash funds
             if bonus > 0 {
                 loan_token.transfer(&env.current_contract_address(), &referrer, &bonus);
                 env.events().publish(
@@ -317,9 +331,7 @@ pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractE
 pub fn loan_status(env: Env, borrower: Address) -> LoanStatus {
     match crate::helpers::get_latest_loan_record(&env, &borrower) {
         None => LoanStatus::None,
-        Some(loan) if loan.repaid => LoanStatus::Repaid,
-        Some(loan) if loan.defaulted => LoanStatus::Defaulted,
-        _ => LoanStatus::Active,
+        Some(loan) => loan.status,
     }
 }
 
@@ -337,7 +349,7 @@ pub fn is_eligible(env: Env, borrower: Address, threshold: i128) -> bool {
     }
 
     if let Some(loan) = crate::helpers::get_latest_loan_record(&env, &borrower) {
-        if !loan.repaid && !loan.defaulted {
+        if loan.status == LoanStatus::Active {
             return false;
         }
     }
